@@ -4,6 +4,7 @@ import pandas as pd
 import os
 import json
 import time 
+import plotly.express as px # <--- 導入 Plotly Express
 
 # ----------------- 設定與金鑰 -----------------
 CWA_API_KEY = os.environ.get("CWA_API_KEY") 
@@ -26,7 +27,6 @@ def call_gemini_api(prompt):
     if not GEMINI_API_KEY:
         return "Gemini API 金鑰未設定。無法生成 LLM 結果。"
     
-    # 這裡不進行快取，因為 LLM 呼叫是整個服務的核心價值和實作要求
     url = f"{LLM_API_URL_BASE}?key={GEMINI_API_KEY}"
     
     payload = {
@@ -39,7 +39,7 @@ def call_gemini_api(prompt):
     for attempt in range(max_retries):
         try:
             res = requests.post(url, json=payload, headers={'Content-Type': 'application/json'})
-            res.raise_for_status()
+            res.raise_for_status() 
             
             data = res.json()
             
@@ -57,7 +57,7 @@ def call_gemini_api(prompt):
             return "❌ LLM 響應處理失敗。"
     return "❌ LLM 服務錯誤。"
 
-@st.cache_data(ttl=3600) # <--- 核心優化：將數據快取 1 小時 (3600秒)
+@st.cache_data(ttl=3600) 
 def extract_cwa_data_for_prompt(location):
     """從 CWA 數據中提取關鍵資訊，用於生成 LLM 的 Prompt"""
     if not CWA_API_KEY:
@@ -67,9 +67,8 @@ def extract_cwa_data_for_prompt(location):
     url = f"https://opendata.cwa.gov.tw/api/v1/rest/datastore/{DATASTORE_ID}?Authorization={CWA_API_KEY}&locationName={location}"
 
     try:
-        # 解決 PaaS 環境中的 SSL 憑證錯誤：verify=False
         res = requests.get(url, verify=False)
-        res.raise_for_status() # 檢查 HTTP 狀態碼
+        res.raise_for_status() 
         data = res.json()
 
         if data.get("success") == "true":
@@ -92,20 +91,24 @@ def extract_cwa_data_for_prompt(location):
                 f"舒適度 (CI): {key_elements.get('CI', '無')}。"
             )
             
-            # 提取繪圖數據
+            # 提取繪圖數據，準備 Plotly 使用
             chart_data = []
             min_t_times = next((e["time"] for e in elements if e["elementName"] == "MinT"), [])
             max_t_times = next((e["time"] for e in elements if e["elementName"] == "MaxT"), [])
             
             for min_t, max_t in zip(min_t_times, max_t_times):
-                time_point = pd.to_datetime(min_t["startTime"]).strftime("%H:%M")
+                # Plotly 可以直接處理 datetime 物件，用於更好的時間軸顯示
+                start_time_dt = pd.to_datetime(min_t["startTime"])
+                
                 chart_data.append({
-                    "時間": time_point,
+                    "時間": start_time_dt, # <--- 這裡改為 datetime 物件
                     "最低溫 (MinT)": int(min_t["parameter"]["parameterName"]),
                     "最高溫 (MaxT)": int(max_t["parameter"]["parameterName"])
                 })
             
-            df_chart = pd.DataFrame(chart_data).set_index("時間") if chart_data else None
+            # 使用 pd.melt 將數據轉換為長格式，Plotly Express 更喜歡這種格式
+            df_chart_raw = pd.DataFrame(chart_data)
+            df_chart = df_chart_raw.melt(id_vars=['時間'], var_name='溫度類型', value_name='溫度 (℃)') # <--- 轉換格式
             
             return prompt_text, df_chart
 
@@ -117,14 +120,14 @@ def extract_cwa_data_for_prompt(location):
         st.error(f"CWA 連線錯誤 (可能是網路或 SSL 問題)。")
         return None, None
     except Exception as e:
-        st.error(f"CWA 數據處理錯誤。")
+        st.error(f"CWA 數據處理錯誤: {e}") # 增加錯誤細節
         return None, None
 
 
 def main():
     st.set_page_config(layout="wide")
     st.title("☁️ 多雲整合服務：LLM 天氣顧問")
-    st.caption("結合 CWA API 數據和 Gemini LLM 處理 (數據快取優化)")
+    st.caption("結合 CWA API 數據和 Gemini LLM 處理 (數據快取與繪圖優化)")
     st.markdown("---")
 
     selected_location = st.selectbox("選擇城市", LOCATIONS)
@@ -145,16 +148,36 @@ def main():
     with st.spinner('正在呼叫 Gemini LLM 進行語氣處理...'):
         llm_response = call_gemini_api(prompt_source)
 
-    # 3. 使用介面將結果回傳 (優化項目 B: 使用 st.info)
     st.info(llm_response)
 
     st.markdown("---")
 
-    # 顯示原始數據圖表
+    # 顯示原始數據圖表 ( Plotly 優化繪圖 )
     if df_chart is not None and not df_chart.empty:
-        st.subheader(f"📊 {selected_location} 36小時溫度趨勢 (原始數據)")
-        st.line_chart(df_chart)
-
+        st.subheader(f"📊 {selected_location} 36小時溫度趨勢")
+        
+        # 使用 Plotly Express 繪製折線圖
+        fig = px.line(df_chart, 
+                      x="時間", 
+                      y="溫度 (℃)", 
+                      color="溫度類型", # 根據溫度類型 (MinT/MaxT) 區分顏色
+                      title=f"{selected_location} 未來 36 小時溫度趨勢",
+                      labels={"溫度 (℃)": "溫度 (攝氏)", "時間": "預報時間"}, # 自定義軸標籤
+                      hover_name="溫度類型", # 鼠標懸停顯示的名稱
+                      line_shape="spline", # 使線條更平滑
+                      template="plotly_white" # 使用白色背景模板
+                     )
+        
+        # 進一步優化圖表佈局和互動性
+        fig.update_traces(mode='lines+markers', hovertemplate="時間: %{x}<br>溫度: %{y}°C<extra></extra>") # 顯示點和更詳細的懸停資訊
+        fig.update_layout(hovermode="x unified", # 統一 X 軸懸停資訊
+                          xaxis_title="預報時間", 
+                          yaxis_title="溫度 (攝氏)",
+                          legend_title="溫度類型",
+                          font=dict(family="Arial, sans-serif", size=12, color="#7f7f7f") # 字體樣式
+                         )
+        
+        st.plotly_chart(fig, use_container_width=True) # <--- 使用 st.plotly_chart 顯示 Plotly 圖表
 
 if __name__ == "__main__":
     main()
